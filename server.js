@@ -19,27 +19,63 @@ app.use('/webhook/shopify', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Email sender (Gmail-friendly config + timeouts for Render)
-const isGmail = (process.env.MAIL_SERVICE || '').toLowerCase() === 'gmail' || (process.env.MAIL_SERVER || '').includes('gmail');
-const transporter = nodemailer.createTransport({
-  service: isGmail ? 'gmail' : undefined,
-  host: isGmail ? undefined : process.env.MAIL_SERVER,
-  port: isGmail ? 465 : parseInt(process.env.MAIL_PORT || '587', 10),
-  secure: isGmail ? true : (process.env.MAIL_PORT === '465'),
-  auth: {
-    user: process.env.MAIL_USERNAME,
-    pass: (process.env.MAIL_PASSWORD || '').replace(/\s+/g, '') // strip spaces from Gmail app password
-  },
-  connectionTimeout: 20000,
-  greetingTimeout: 20000,
-  socketTimeout: 30000
-});
+// Prefer HTTP email provider (Resend) if available; fallback to SMTP (Gmail)
+const USE_RESEND = !!process.env.RESEND_API_KEY;
 
-transporter.verify().then(() => {
-  console.log('SMTP server is ready to send emails');
-}).catch((err) => {
-  console.error('SMTP configuration error:', err);
-});
+let transporter = null;
+if (!USE_RESEND) {
+  const isGmail = (process.env.MAIL_SERVICE || '').toLowerCase() === 'gmail' || (process.env.MAIL_SERVER || '').includes('gmail');
+  transporter = nodemailer.createTransport({
+    service: isGmail ? 'gmail' : undefined,
+    host: isGmail ? undefined : process.env.MAIL_SERVER,
+    port: isGmail ? 465 : parseInt(process.env.MAIL_PORT || '587', 10),
+    secure: isGmail ? true : (process.env.MAIL_PORT === '465'),
+    auth: {
+      user: process.env.MAIL_USERNAME,
+      pass: (process.env.MAIL_PASSWORD || '').replace(/\s+/g, '')
+    },
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    socketTimeout: 30000
+  });
+
+  transporter.verify().then(() => {
+    console.log('SMTP server is ready to send emails');
+  }).catch((err) => {
+    console.error('SMTP configuration error:', err);
+  });
+} else {
+  console.log('Using Resend API for email delivery');
+}
+
+async function deliverEmail(mail) {
+  if (USE_RESEND) {
+    const apiKey = process.env.RESEND_API_KEY;
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: mail.from,
+        to: Array.isArray(mail.to) ? mail.to : [mail.to],
+        subject: mail.subject,
+        html: mail.html,
+        text: mail.text
+      })
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`Resend API error ${response.status}: ${text}`);
+    }
+    const data = await response.json();
+    return { messageId: data?.id || 'resend', accepted: [mail.to].flat() };
+  }
+
+  const info = await transporter.sendMail(mail);
+  return { messageId: info.messageId, accepted: info.accepted };
+}
 
 // Minimal welcome email endpoint
 app.post('/welcome', async (req, res) => {
@@ -63,7 +99,7 @@ app.post('/welcome', async (req, res) => {
       text: `Welcome${name ? `, ${name}` : ''}!\n\nThanks for visiting. We're glad to have you here.`
     };
 
-    const info = await transporter.sendMail(mail);
+    const info = await deliverEmail(mail);
     return res.json({ success: true, messageId: info.messageId, accepted: info.accepted });
   } catch (err) {
     console.error('Email send error:', err);
@@ -140,7 +176,7 @@ app.post('/webhook/shopify', async (req, res) => {
       text: `Welcome${name ? `, ${name}` : ''}!\n\nThanks for visiting. We're glad to have you here.\nShop: ${shop} • Topic: ${topic}`
     };
 
-    await transporter.sendMail(mail);
+    await deliverEmail(mail);
     return res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook error:', err);
