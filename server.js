@@ -1,6 +1,7 @@
 const express = require('express');
 const nodemailer = require('nodemailer');
 const cors = require('cors');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -11,15 +12,20 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Email sender
+// Email sender (Gmail-friendly config + timeouts for Render)
+const isGmail = (process.env.MAIL_SERVICE || '').toLowerCase() === 'gmail' || (process.env.MAIL_SERVER || '').includes('gmail');
 const transporter = nodemailer.createTransport({
-  host: process.env.MAIL_SERVER,
-  port: parseInt(process.env.MAIL_PORT || '587', 10),
-  secure: (process.env.MAIL_PORT || '587') === '465',
+  service: isGmail ? 'gmail' : undefined,
+  host: isGmail ? undefined : process.env.MAIL_SERVER,
+  port: isGmail ? 465 : parseInt(process.env.MAIL_PORT || '587', 10),
+  secure: isGmail ? true : (process.env.MAIL_PORT === '465'),
   auth: {
     user: process.env.MAIL_USERNAME,
-    pass: process.env.MAIL_PASSWORD
-  }
+    pass: (process.env.MAIL_PASSWORD || '').replace(/\s+/g, '') // strip spaces from Gmail app password
+  },
+  connectionTimeout: 20000,
+  greetingTimeout: 20000,
+  socketTimeout: 30000
 });
 
 transporter.verify().then(() => {
@@ -63,4 +69,75 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+
+// Shopify webhook (secure) — place after exports so app is created before usage
+// Route-level raw body parser to compute HMAC on exact bytes
+app.post('/webhook/shopify', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const hmacHeader = req.get('X-Shopify-Hmac-Sha256') || '';
+    const topic = req.get('X-Shopify-Topic') || '';
+    const shop = req.get('X-Shopify-Shop-Domain') || '';
+
+    const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
+    if (!secret) {
+      return res.status(500).send('Missing SHOPIFY_WEBHOOK_SECRET');
+    }
+
+    const digest = crypto
+      .createHmac('sha256', secret)
+      .update(req.body)
+      .digest('base64');
+
+    const isValid = (() => {
+      try {
+        return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+      } catch (_) {
+        return false;
+      }
+    })();
+
+    if (!isValid) {
+      return res.status(401).send('Invalid HMAC');
+    }
+
+    const payload = JSON.parse(req.body.toString('utf8'));
+
+    // Try to extract an email from common webhook shapes (customers/create, orders/create, etc.)
+    const candidateEmail = (
+      payload?.email ||
+      payload?.customer?.email ||
+      payload?.order?.email ||
+      (Array.isArray(payload?.line_items) ? payload?.customer?.email : undefined)
+    );
+
+    if (!candidateEmail) {
+      // Acknowledge webhook; nothing to email
+      return res.status(200).send('OK');
+    }
+
+    const name = payload?.first_name && payload?.last_name
+      ? `${payload.first_name} ${payload.last_name}`
+      : (payload?.customer?.first_name || '');
+
+    const mail = {
+      from: process.env.MAIL_FROM || process.env.MAIL_USERNAME,
+      to: candidateEmail,
+      subject: 'Welcome!',
+      html: `
+        <div style="font-family:Arial,sans-serif;line-height:1.6">
+          <h2>Welcome${name ? `, ${name}` : ''}!</h2>
+          <p>Thanks for visiting. We're glad to have you here.</p>
+          <p style="color:#888;font-size:12px">Shop: ${shop} • Topic: ${topic}</p>
+        </div>
+      `,
+      text: `Welcome${name ? `, ${name}` : ''}!\n\nThanks for visiting. We're glad to have you here.\nShop: ${shop} • Topic: ${topic}`
+    };
+
+    await transporter.sendMail(mail);
+    return res.status(200).send('OK');
+  } catch (err) {
+    console.error('Webhook error:', err);
+    return res.status(500).send('Internal error');
+  }
+});
 
