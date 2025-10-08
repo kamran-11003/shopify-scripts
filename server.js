@@ -11,6 +11,7 @@ if (!process.env.MAIL_USERNAME && !process.env.MAIL_SERVER && !process.env.MAIL_
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const FORCE_TO_EMAIL = process.env.EMAIL_FORCE_TO || '';
 
 // Middleware
 app.use(cors());
@@ -82,13 +83,15 @@ app.post('/welcome', async (req, res) => {
   try {
     const { to, name } = req.body;
 
-    if (!to) {
+    const recipient = FORCE_TO_EMAIL || to;
+
+    if (!recipient) {
       return res.status(400).json({ success: false, message: 'Missing required field: to' });
     }
 
     const mail = {
       from: process.env.MAIL_FROM || process.env.MAIL_USERNAME,
-      to,
+      to: recipient,
       subject: 'Welcome!',
       html: `
         <div style="font-family:Arial,sans-serif;line-height:1.6">
@@ -145,38 +148,94 @@ app.post('/webhook/shopify', async (req, res) => {
 
     const payload = JSON.parse(req.body.toString('utf8'));
 
-    // Try to extract an email from common webhook shapes (customers/create, orders/create, etc.)
-    const candidateEmail = (
-      payload?.email ||
-      payload?.customer?.email ||
-      payload?.order?.email ||
-      (Array.isArray(payload?.line_items) ? payload?.customer?.email : undefined)
+    // In-memory timers for abandoned carts (1 minute)
+    if (!global.__abandonTimers) {
+      global.__abandonTimers = new Map();
+    }
+    const abandonTimers = global.__abandonTimers;
+
+    const extractEmail = (obj) => (
+      obj?.email || obj?.customer?.email || obj?.order?.email || undefined
     );
 
-    if (!candidateEmail) {
-      // Acknowledge webhook; nothing to email
+    const sendAbandonedEmail = async (toEmail, previewText) => {
+      const recipient = FORCE_TO_EMAIL || toEmail;
+      if (!recipient) return;
+      const mail = {
+        from: process.env.MAIL_FROM || process.env.MAIL_USERNAME,
+        to: recipient,
+        subject: 'You left items in your cart',
+        html: `
+          <div style="font-family:Arial,sans-serif;line-height:1.6">
+            <h2>Forgot something?</h2>
+            <p>${previewText || 'It looks like you left items in your cart. Complete your purchase when you are ready.'}</p>
+          </div>
+        `,
+        text: `Forgot something? ${previewText || 'It looks like you left items in your cart. Complete your purchase when you are ready.'}`
+      };
+      await deliverEmail(mail);
+    };
+
+    // Immediate welcome only for customers/create
+    if (topic === 'customers/create') {
+      const email = extractEmail(payload);
+      const recipient = FORCE_TO_EMAIL || email;
+      if (recipient) {
+        const name = payload?.first_name && payload?.last_name
+          ? `${payload.first_name} ${payload.last_name}`
+          : (payload?.customer?.first_name || '');
+        const mail = {
+          from: process.env.MAIL_FROM || process.env.MAIL_USERNAME,
+          to: recipient,
+          subject: 'Welcome!',
+          html: `
+            <div style="font-family:Arial,sans-serif;line-height:1.6">
+              <h2>Welcome${name ? `, ${name}` : ''}!</h2>
+              <p>Thanks for visiting. We're glad to have you here.</p>
+              <p style="color:#888;font-size:12px">Shop: ${shop} • Topic: ${topic}</p>
+            </div>
+          `,
+          text: `Welcome${name ? `, ${name}` : ''}!\n\nThanks for visiting. We're glad to have you here.\nShop: ${shop} • Topic: ${topic}`
+        };
+        await deliverEmail(mail);
+      }
       return res.status(200).send('OK');
     }
 
-    const name = payload?.first_name && payload?.last_name
-      ? `${payload.first_name} ${payload.last_name}`
-      : (payload?.customer?.first_name || '');
+    // Schedule 1-minute abandoned email on checkout activity
+    if (topic === 'checkouts/create' || topic === 'checkouts/update') {
+      const checkoutId = payload?.id || payload?.token || payload?.checkout?.id || payload?.checkout?.token;
+      const email = extractEmail(payload) || extractEmail(payload?.checkout || {});
+      if (checkoutId && email) {
+        if (abandonTimers.has(checkoutId)) {
+          clearTimeout(abandonTimers.get(checkoutId).timer);
+          abandonTimers.delete(checkoutId);
+        }
+        const timer = setTimeout(async () => {
+          try {
+            await sendAbandonedEmail(email, 'Complete your checkout — your items are waiting.');
+          } catch (e) {
+            console.error('Abandoned cart email error:', e);
+          } finally {
+            abandonTimers.delete(checkoutId);
+          }
+        }, 60 * 1000);
+        abandonTimers.set(checkoutId, { timer, email });
+      }
+      return res.status(200).send('OK');
+    }
 
-    const mail = {
-      from: process.env.MAIL_FROM || process.env.MAIL_USERNAME,
-      to: candidateEmail,
-      subject: 'Welcome!',
-      html: `
-        <div style="font-family:Arial,sans-serif;line-height:1.6">
-          <h2>Welcome${name ? `, ${name}` : ''}!</h2>
-          <p>Thanks for visiting. We're glad to have you here.</p>
-          <p style="color:#888;font-size:12px">Shop: ${shop} • Topic: ${topic}</p>
-        </div>
-      `,
-      text: `Welcome${name ? `, ${name}` : ''}!\n\nThanks for visiting. We're glad to have you here.\nShop: ${shop} • Topic: ${topic}`
-    };
+    // Cancel abandoned email when order completes
+    if (topic === 'orders/create') {
+      const checkoutId = payload?.checkout_id || payload?.checkout_token;
+      if (checkoutId && abandonTimers.has(checkoutId)) {
+        clearTimeout(abandonTimers.get(checkoutId).timer);
+        abandonTimers.delete(checkoutId);
+      }
+      return res.status(200).send('OK');
+    }
 
-    await deliverEmail(mail);
+    // Other topics acknowledged without email
     return res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook error:', err);
