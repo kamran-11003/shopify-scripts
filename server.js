@@ -116,6 +116,12 @@ app.listen(PORT, () => {
 
 module.exports = app;
 
+// Debug endpoint to inspect pending abandoned cart timers
+app.get('/debug/abandon', (req, res) => {
+  const timers = (global.__abandonTimers && Array.from(global.__abandonTimers.entries()).map(([id, v]) => ({ id, email: v.email }))) || [];
+  res.json({ count: timers.length, timers });
+});
+
 // Shopify webhook (secure) — place after exports so app is created before usage
 // Route-level raw body parser to compute HMAC on exact bytes
 app.post('/webhook/shopify', async (req, res) => {
@@ -123,6 +129,7 @@ app.post('/webhook/shopify', async (req, res) => {
     const hmacHeader = req.get('X-Shopify-Hmac-Sha256') || '';
     const topic = req.get('X-Shopify-Topic') || '';
     const shop = req.get('X-Shopify-Shop-Domain') || '';
+    console.log('[Webhook] incoming', { topic, shop, contentLength: req.headers['content-length'] });
 
     const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
     if (!secret) {
@@ -143,8 +150,10 @@ app.post('/webhook/shopify', async (req, res) => {
     })();
 
     if (!isValid) {
+      console.warn('[Webhook] invalid HMAC', { topic, shop });
       return res.status(401).send('Invalid HMAC');
     }
+    console.log('[Webhook] HMAC verified', { topic, shop });
 
     const payload = JSON.parse(req.body.toString('utf8'));
 
@@ -180,6 +189,7 @@ app.post('/webhook/shopify', async (req, res) => {
     if (topic === 'customers/create') {
       const email = extractEmail(payload);
       const recipient = FORCE_TO_EMAIL || email;
+      console.log('[Webhook] customers/create', { shop, email, forced: !!FORCE_TO_EMAIL });
       if (recipient) {
         const name = payload?.first_name && payload?.last_name
           ? `${payload.first_name} ${payload.last_name}`
@@ -198,6 +208,7 @@ app.post('/webhook/shopify', async (req, res) => {
           text: `Welcome${name ? `, ${name}` : ''}!\n\nThanks for visiting. We're glad to have you here.\nShop: ${shop} • Topic: ${topic}`
         };
         await deliverEmail(mail);
+        console.log('[Email] welcome sent', { to: recipient });
       }
       return res.status(200).send('OK');
     }
@@ -210,17 +221,23 @@ app.post('/webhook/shopify', async (req, res) => {
         if (abandonTimers.has(checkoutId)) {
           clearTimeout(abandonTimers.get(checkoutId).timer);
           abandonTimers.delete(checkoutId);
+          console.log('[Abandon] rescheduled', { checkoutId, email });
         }
         const timer = setTimeout(async () => {
           try {
             await sendAbandonedEmail(email, 'Complete your checkout — your items are waiting.');
+            console.log('[Email] abandoned sent', { to: FORCE_TO_EMAIL || email, checkoutId });
           } catch (e) {
             console.error('Abandoned cart email error:', e);
           } finally {
             abandonTimers.delete(checkoutId);
+            console.log('[Abandon] cleared', { checkoutId });
           }
         }, 60 * 1000);
         abandonTimers.set(checkoutId, { timer, email });
+        console.log('[Abandon] scheduled', { checkoutId, email, delayMs: 60000, timers: abandonTimers.size });
+      } else {
+        console.log('[Abandon] missing checkoutId or email', { checkoutId, emailPresent: !!email });
       }
       return res.status(200).send('OK');
     }
@@ -231,6 +248,7 @@ app.post('/webhook/shopify', async (req, res) => {
       if (checkoutId && abandonTimers.has(checkoutId)) {
         clearTimeout(abandonTimers.get(checkoutId).timer);
         abandonTimers.delete(checkoutId);
+        console.log('[Abandon] canceled due to order', { checkoutId });
       }
       return res.status(200).send('OK');
     }
