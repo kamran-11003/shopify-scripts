@@ -2,13 +2,20 @@ const express = require('express');
 const nodemailer = require('nodemailer');
 const cors = require('cors');
 const crypto = require('crypto');
-require('dotenv').config();
+const dotenv = require('dotenv');
+// Load .env by default; if not set, try a file named 'env'
+dotenv.config();
+if (!process.env.MAIL_USERNAME && !process.env.MAIL_SERVER && !process.env.MAIL_SERVICE) {
+  dotenv.config({ path: './env' });
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
+// Ensure raw body for Shopify webhook BEFORE JSON parsing
+app.use('/webhook/shopify', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -72,7 +79,7 @@ module.exports = app;
 
 // Shopify webhook (secure) — place after exports so app is created before usage
 // Route-level raw body parser to compute HMAC on exact bytes
-app.post('/webhook/shopify', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/webhook/shopify', async (req, res) => {
   try {
     const hmacHeader = req.get('X-Shopify-Hmac-Sha256') || '';
     const topic = req.get('X-Shopify-Topic') || '';
